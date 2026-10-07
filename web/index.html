@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>auto-dark</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%23161618' stroke='%23e0902f' stroke-width='3'/%3E%3Cpath d='M16 5a11 11 0 0 0 0 22z' fill='%23e0902f'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+<script defer src="app.js"></script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+      <circle cx="16" cy="16" r="12.5" class="logo-ring"/>
+      <path d="M16 6.5a9.5 9.5 0 0 0 0 19z" class="logo-half"/>
+    </svg>
+    <span class="brand-name">auto-dark</span>
+    <span class="brand-tag">flashbang guard</span>
+  </div>
+
+  <div class="conn" id="conn" title="Engine connection">
+    <i class="led"></i><span id="conn-text">connecting…</span>
+  </div>
+
+  <div class="profilebar" role="group" aria-label="Profiles">
+    <label class="bar-label" for="profile-select">Profile</label>
+    <div class="profile-select-wrap">
+      <select id="profile-select" title="Switch profile (loads it)"></select>
+      <i id="dirty-dot" class="dirty-dot" title="Unsaved changes" hidden></i>
+    </div>
+    <button type="button" class="btn" id="btn-save" title="Save current settings to the active profile">Save</button>
+    <button type="button" class="btn" id="btn-saveas" title="Save current settings under a new name">Save as…</button>
+    <button type="button" class="btn" id="btn-revert" title="Discard changes: reload the active profile">Revert</button>
+    <button type="button" class="btn btn-danger" id="btn-delete" title="Delete the active profile">Delete</button>
+  </div>
+
+  <button type="button" class="bypass" id="bypass" aria-pressed="false" title="Toggle bypass (Ctrl+Alt+F12)">
+    <i class="led"></i>
+    <span class="bypass-text"><span class="bypass-main">BYPASS</span><span class="bypass-sub" id="bypass-sub">filter active</span></span>
+  </button>
+</header>
+
+<div class="banners" id="banners">
+  <div class="banner banner-error" id="banner-shader" hidden role="alert">
+    <div class="banner-title">Shader compile error <span class="banner-note">· last good shaders are still running</span></div>
+    <pre class="shader-error" id="shader-error"></pre>
+  </div>
+  <div class="banner banner-warn" id="banner-capture" hidden role="alert">
+    <b>Overlay could not be excluded from capture</b> — feedback loop likely (the filter will see its own dimming).
+  </div>
+  <div class="banner banner-info" id="banner-bypass" hidden>
+    <b>Bypassed</b> — nothing is being dimmed. Click BYPASS or press Ctrl+Alt+F12 to re-engage.
+  </div>
+</div>
+
+<main class="layout">
+  <div class="col col-controls" id="controls" aria-label="Parameters"></div>
+
+  <div class="col col-live">
+    <section class="card card-live" id="live">
+      <header class="card-h">
+        <h2>Live</h2>
+        <div class="card-tools">
+          <span class="pv-fps mono" id="pv-fps"></span>
+          <button type="button" class="btn btn-sm" id="btn-reset-temporal" title="Reset the temporal (attack/release) state">Reset temporal</button>
+        </div>
+      </header>
+      <div class="live-body">
+        <div class="pv">
+          <div class="pv-toolbar">
+            <div class="seg" id="mon-seg" role="group" aria-label="Monitor"></div>
+            <div class="seg" id="mode-seg" role="group" aria-label="Preview mode"></div>
+          </div>
+          <div class="pv-frame" id="pv-frame">
+            <img id="pv-img" alt="Preview of the selected monitor">
+            <div class="pv-empty" id="pv-empty">no frame yet</div>
+            <span class="pv-badge" id="pv-badge"></span>
+          </div>
+        </div>
+        <div class="meters-wrap">
+          <div class="meters-legend">
+            <span class="lg lg-in">in</span><span class="lg lg-out">out</span><span class="lg lg-gr">reduction</span>
+            <span class="meters-scale">mean linear luminance · log · last 20 s</span>
+          </div>
+          <div class="meters" id="meters"></div>
+        </div>
+      </div>
+    </section>
+    <div id="curve-slot"></div>
+  </div>
+</main>
+
+<footer class="hotkeys">
+  <span><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>F12</kbd> bypass</span>
+  <span><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>F11</kbd> next profile</span>
+  <span><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>F10</kbd> cycle debug view</span>
+  <span class="hk-tip">Double-click a label to reset · click a value to type it · ↑/↓ nudge (Shift ×10)</span>
+</footer>
+
+<div class="offline" id="offline" hidden role="alertdialog" aria-labelledby="offline-title">
+  <div class="offline-card">
+    <div class="offline-head"><i class="led led-off"></i><h2 id="offline-title">Engine not running</h2></div>
+    <p>Can't reach the auto-dark engine at <code id="offline-host"></code>.
+       Start <code>auto-dark.exe</code> — this page reconnects automatically.</p>
+    <p class="offline-detail mono" id="offline-detail">retrying…</p>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+</body>
+</html>

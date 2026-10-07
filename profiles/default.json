@@ -1,0 +1,47 @@
+{
+  "name": "default",
+  "params": {
+    "attackMs": 0,
+    "curve": [
+      [
+        -7,
+        1
+      ],
+      [
+        -3.5,
+        1
+      ],
+      [
+        -2,
+        0.6
+      ],
+      [
+        -1,
+        0.3
+      ],
+      [
+        -0.5,
+        0.2
+      ],
+      [
+        0,
+        0.15
+      ]
+    ],
+    "darkFloor": 0.085,
+    "debugOpacity": 0.5,
+    "debugView": 0,
+    "maxLevel": 12,
+    "minGain": 0.33,
+    "minLevel": 2,
+    "protectDarks": 0,
+    "releaseMs": 500,
+    "selectScale": 4,
+    "selective": 1,
+    "softness": 0.5,
+    "splitPos": 0.5,
+    "spread": 2,
+    "strength": 0.95,
+    "threshold": 0
+  }
+}
