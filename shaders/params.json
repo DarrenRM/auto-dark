@@ -45,7 +45,7 @@
       "help": "Time constant for brightening back up once content gets darker." },
 
     {"id": "preDimShow", "label": "New / restored windows", "group": "protect", "type": "enum", "options": ["Off", "On"], "default": 1,
-      "help": "Pre-dim a window when it is shown or restored from minimized." },
+      "help": "Pre-dim a window when it is shown or restored from minimized, and the whole screen when the desktop is revealed (Win+D, minimize all) in case the wallpaper is bright." },
     {"id": "preDimForeground", "label": "Activated windows", "group": "protect", "type": "enum", "options": ["Off", "On"], "default": 0,
       "help": "Also pre-dim on every foreground switch (Alt+Tab, clicks). Catches covered windows coming to the front, but dips dark windows briefly." },
     {"id": "preDimTitle", "label": "Title changes", "group": "protect", "type": "enum", "options": ["Off", "On"], "default": 0,

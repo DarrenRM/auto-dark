@@ -27,6 +27,7 @@
 #include "monitor.h"
 #include "params.h"
 #include "shaders.h"
+#include "tray.h"
 
 using Microsoft::WRL::ComPtr;
 namespace fs = std::filesystem;
@@ -48,6 +49,8 @@ struct Shared {
   std::atomic<bool> bypass{false};
   std::atomic<bool> resetTemporal{false};
   std::atomic<bool> quit{false};
+  std::atomic<int> panelRequest{0};  // 1 = start/open the tuning panel, 2 = stop it (from the tray)
+  std::atomic<bool> panelRunning{false};
   // preview: requested by the UI, rendered by the render thread
   int previewMon = 0, previewMode = 0;
   std::chrono::steady_clock::time_point previewRequested{};
@@ -64,12 +67,39 @@ struct PreDimEvent {
   int64_t qpc;
 };
 std::vector<PreDimEvent> g_preDims;  // main thread only (WinEvent callbacks run on it)
+// Desktop memory: the wallpaper rarely changes, so remember whether the desktop was bright when it
+// was last in front, and only pre-dim a desktop reveal if it was (or if we don't know yet).
+int g_desktopBright = -1;  // -1 unknown, 0 dark, 1 bright
+std::chrono::steady_clock::time_point g_desktopFgSince{};
+bool g_desktopFg = false, g_desktopMeasured = false;
 bool g_preDimNew = false;
 ParamStore* g_paramsForHooks = nullptr;
 
 void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
   if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !hwnd || !g_paramsForHooks) return;
   const ParamStore& p = *g_paramsForHooks;
+  // Revealing the desktop (Win+D, minimize all) brings the wallpaper forward without showing a new
+  // window: treat the desktop becoming foreground like a newly shown window.
+  wchar_t cls[32] = {};
+  GetClassNameW(hwnd, cls, 32);
+  bool desktop = event == EVENT_SYSTEM_FOREGROUND && (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW"));
+  if (event == EVENT_SYSTEM_FOREGROUND) {
+    g_desktopFg = desktop;
+    g_desktopMeasured = false;
+    if (desktop) g_desktopFgSince = std::chrono::steady_clock::now();
+  }
+  if (desktop) {
+    if (p.get("preDimShow", 1) < 0.5 || g_desktopBright == 0) return;
+    RECT vr{GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), 0, 0};
+    vr.right = vr.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    vr.bottom = vr.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    g_preDims.push_back({vr, std::chrono::steady_clock::now(), q.QuadPart});
+    if (g_preDims.size() > 8) g_preDims.erase(g_preDims.begin());
+    g_preDimNew = true;
+    return;
+  }
   bool want = (event == EVENT_OBJECT_SHOW || event == EVENT_SYSTEM_MINIMIZEEND) ? p.get("preDimShow", 1) >= 0.5
               : event == EVENT_SYSTEM_FOREGROUND                                ? p.get("preDimForeground", 0) >= 0.5
               : event == EVENT_OBJECT_NAMECHANGE                                ? p.get("preDimTitle", 0) >= 0.5
@@ -254,6 +284,8 @@ struct Args {
   int port = 7777;
   bool bypass = false;
   bool open = false;
+  bool panel = false;    // start the tuning panel's web server at launch
+  bool console = false;  // show a console window with the log
   bool exclude = true;
   bool debugLayer = false;
   bool vblankPacing = false;  // old loop timing, for A/B latency comparison
@@ -269,7 +301,9 @@ Args parseArgs() {
     std::wstring s = argv[i];
     if (s == L"--port" && i + 1 < argc) a.port = _wtoi(argv[++i]);
     else if (s == L"--bypass") a.bypass = true;
-    else if (s == L"--open") a.open = true;
+    else if (s == L"--open") a.open = a.panel = true;
+    else if (s == L"--panel") a.panel = true;
+    else if (s == L"--console") a.console = true;
     else if (s == L"--no-exclude") a.exclude = false;
     else if (s == L"--debug-layer") a.debugLayer = true;
     else if (s == L"--vblank") a.vblankPacing = true;
@@ -363,13 +397,26 @@ void publishMonitors(const std::vector<std::unique_ptr<Monitor>>& mons) {
 }  // namespace
 
 int main() {
+  Args args = parseArgs();
+  // One engine at a time: a second launch asks the running one to open its tuning panel.
+  HANDLE instance = CreateMutexW(nullptr, TRUE, L"Local\\auto-dark-engine");  // held for the process lifetime
+  (void)instance;
+  if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    if (HWND other = FindWindowW(Tray::kWindowClass, nullptr)) PostMessageW(other, Tray::kMsgOpenPanel, 0, 0);
+    return 0;
+  }
+  if (args.console && AllocConsole()) {
+    FILE* f;
+    freopen_s(&f, "CONOUT$", "w", stdout);
+  }
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   SetConsoleCtrlHandler(ConsoleHandler, TRUE);
   CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   timeBeginPeriod(1);
 
-  Args args = parseArgs();
   std::string root = findRoot();
+  fs::create_directories(fs::u8path(root + "/logs"));
+  logToFile((root + "/logs/auto-dark.log").c_str());
   logf("auto-dark starting (root %s)", root.c_str());
 
   ParamStore params(root);
@@ -415,11 +462,54 @@ int main() {
   RegisterHotKey(nullptr, kHotDebug, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F10);
   logf("hotkeys: Ctrl+Alt+F12 bypass, Ctrl+Alt+F11 next profile, Ctrl+Alt+F10 debug view");
 
+  // The tuning panel's web server only runs on request (tray menu, --panel, --open).
   HttpServer http;
-  http.start(args.port, [&](const HttpRequest& req) {
-    if (req.path.rfind("/api/", 0) == 0) return handleApi(root, params, req);
-    if (req.method != "GET") return jsonResponse(json::Object{{"error", "not found"}}, 404);
-    return serveStatic(root, req.path);
+  std::wstring panelUrl = L"http://127.0.0.1:" + std::to_wstring(args.port) + L"/";
+  auto startPanel = [&] {
+    if (g.panelRunning) return true;
+    bool ok = http.start(args.port, [&](const HttpRequest& req) {
+      if (req.path.rfind("/api/", 0) == 0) return handleApi(root, params, req);
+      if (req.method != "GET") return jsonResponse(json::Object{{"error", "not found"}}, 404);
+      return serveStatic(root, req.path);
+    });
+    g.panelRunning = ok;
+    return ok;
+  };
+  auto stopPanel = [&] {
+    if (!g.panelRunning) return;
+    http.stop();
+    g.panelRunning = false;
+    logf("http: tuning panel stopped");
+  };
+  if (args.panel) startPanel();
+
+  Tray tray;
+  tray.start(TrayActions{
+      [&] {
+        return TrayState{g.bypass.load(), g.panelRunning.load(), Tray::startupEnabled(), params.listProfiles(),
+                         params.activeProfile()};
+      },
+      [&] {
+        g.bypass = !g.bypass;
+        logf("bypass %s (tray)", g.bypass ? "ON" : "off");
+      },
+      [&] {
+        g.panelRequest = 1;
+        SetEvent(wake);
+      },
+      [&] {
+        g.panelRequest = 2;
+        SetEvent(wake);
+      },
+      [&] {
+        g.quit = true;
+        SetEvent(wake);
+      },
+      [&](const std::string& name) {
+        std::string err;
+        if (params.loadProfile(name, err)) g.resetTemporal = true;
+        else logf("tray: %s", err.c_str());
+      },
   });
   g_paramsForHooks = &params;
   HWINEVENTHOOK hooks[] = {
@@ -438,8 +528,7 @@ int main() {
           args.probeY < m->desktop.bottom)
         m->enableProbe(args.probeX, args.probeY);
 
-  if (args.open) ShellExecuteW(nullptr, L"open", (L"http://127.0.0.1:" + std::to_wstring(args.port) + L"/").c_str(),
-                               nullptr, nullptr, SW_SHOWNORMAL);
+  if (args.open && g.panelRunning) ShellExecuteW(nullptr, L"open", panelUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 
   ColorPlan color;
   float lastColor[16] = {};
@@ -454,6 +543,12 @@ int main() {
        lastTopmost = start;
 
   while (!g.quit) {
+    // Tray requests for the tuning panel.
+    if (int req = g.panelRequest.exchange(0)) {
+      if (req == 1 && startPanel()) ShellExecuteW(nullptr, L"open", panelUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+      if (req == 2) stopPanel();
+    }
+
     MSG msg;
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
       if (msg.message == WM_QUIT) g.quit = true;
@@ -584,18 +679,28 @@ int main() {
     bool animating = false;
     for (auto& m : monitors) animating |= m->process(in);
 
-    // Stats for the meters (5 Hz).
+    // Stats (5 Hz): the panel's meters, and the desktop-brightness memory.
     if (now - lastStats > std::chrono::milliseconds(200)) {
       lastStats = now;
       json::Array arr;
+      double strongestDim = 1;
       for (auto& m : monitors) {
         MonitorStats s;
         m->readStats(in, s);
+        if (!m->lost()) strongestDim = std::min(strongestDim, s.minGain);
         arr.push_back(json::Object{{"index", m->index}, {"fps", s.fps}, {"frameMs", s.frameMs},
                                    {"latMs", s.latMs}, {"latMaxMs", s.latMaxMs}, {"acqMs", s.acqMs},
                                    {"refreshMs", refreshMs}, {"inMean", s.inMean},
                                    {"outMean", s.outMean}, {"minGain", s.minGain}, {"brightMean", s.brightMean},
                                    {"lost", m->lost()}});
+      }
+      // Desktop has been in front for a moment: remember whether the guard had to dim it.
+      if (g_desktopFg && !g_desktopMeasured &&
+          std::chrono::duration<double, std::milli>(now - g_desktopFgSince).count() > 600) {
+        g_desktopMeasured = true;
+        int bright = strongestDim < 0.95 ? 1 : 0;
+        if (bright != g_desktopBright) logf("desktop memory: wallpaper %s", bright ? "bright" : "dark");
+        g_desktopBright = bright;
       }
       if (args.probeX >= 0) {
         static const double qpcPerMs = [] {
@@ -664,7 +769,8 @@ int main() {
   }
 
   logf("shutting down");
-  http.stop();
+  tray.stop();
+  stopPanel();
   for (auto h : hooks)
     if (h) UnhookWinEvent(h);
   monitors.clear();

@@ -13,7 +13,14 @@ add_executable(auto-dark
   src/http.cpp
   src/jpeg.cpp
   src/color.cpp
+  src/tray.cpp
 )
+
+# Runs as a background tray app: no console window (use --console for one). Keep main() as entry.
+set_target_properties(auto-dark PROPERTIES WIN32_EXECUTABLE TRUE)
+if(MSVC)
+  target_link_options(auto-dark PRIVATE /ENTRY:mainCRTStartup)
+endif()
 
 # Shaders, web UI and profiles are loaded from the source tree so they hot-reload while editing.
 target_compile_definitions(auto-dark PRIVATE

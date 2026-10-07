@@ -14,15 +14,25 @@ cmake --build build --config Release
 ## Run
 
 ```bash
-./build/Release/auto-dark.exe --open
+./build/Release/auto-dark.exe
 ```
 
-Then use the control panel at http://127.0.0.1:7777/. The console window shows the log; close it
-or press Ctrl+C to stop. Stopping removes all dimming immediately.
+It runs in the background as a **tray app** (no window). The tray icon is amber while guarding and
+grey while bypassed. Right-click it for:
+
+- **Bypass**, **Profile** (switch), **Exit**
+- **Open tuning panel**: starts the web panel at http://127.0.0.1:7777/ and opens it (double-click
+  the icon does the same). **Stop tuning panel** turns the web server off again; it is off by default.
+- **Start with Windows**: adds or removes a per-user startup entry (no admin needed).
+
+Launching it again while it's running opens the tuning panel of the running copy. The log is at
+`logs/auto-dark.log`; `--console` shows it live.
 
 | Flag | Effect |
 |---|---|
-| `--open` | open the control panel in your browser |
+| `--open` | start the tuning panel and open it in your browser |
+| `--panel` | start the tuning panel's web server (without opening a browser) |
+| `--console` | show a console window with the log |
 | `--bypass` | start with filtering off |
 | `--profile NAME` | start with a given profile |
 | `--port N` | panel port (default 7777) |
