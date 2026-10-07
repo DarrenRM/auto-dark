@@ -26,6 +26,11 @@ float4 PSMain(VSOut i) : SV_Target {
   float G = SampleBSpline(gGain, i.uv, gStateSize.xy);
   float g = ResponseGain(G, L.b, SelectCoverage(gLuma, i.uv));
 
+  // Just-shown window whose content hasn't been measured yet: assume the worst and dim plainly
+  // (no colour, since the captured pixels underneath are stale).
+  float gp = PreDimGain(i.uv);
+  if (gp < g) return float4(0, 0, 0, 1 - EncodedGain(gp));
+
   int view = (int)(debugView + 0.5);
   float ge = EncodedGain(g);
   if (view == 1) {  // selection mask tinted red

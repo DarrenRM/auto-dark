@@ -4,6 +4,8 @@
 #include <d3d11.h>
 #include <dcomp.h>
 #include <dxgi1_2.h>
+#include <avrt.h>
+#include <dwmapi.h>
 #include <shellapi.h>
 #include <timeapi.h>
 #include <wrl/client.h>
@@ -41,6 +43,7 @@ struct Shared {
   json::Value monitors = json::Array{};
   json::Value stats = json::Object{};
   std::string shaderError;
+  json::Value probe = json::Object{};  // test probe samples + pre-dim events (QPC-based ms)
   bool captureExcluded = true;
   std::atomic<bool> bypass{false};
   std::atomic<bool> resetTemporal{false};
@@ -53,6 +56,48 @@ struct Shared {
 };
 
 Shared g;
+
+// ---- "Start protected": windows that just appeared get dimmed before their content is captured.
+struct PreDimEvent {
+  RECT rect;
+  std::chrono::steady_clock::time_point t;
+  int64_t qpc;
+};
+std::vector<PreDimEvent> g_preDims;  // main thread only (WinEvent callbacks run on it)
+bool g_preDimNew = false;
+ParamStore* g_paramsForHooks = nullptr;
+
+void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
+  if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !hwnd || !g_paramsForHooks) return;
+  const ParamStore& p = *g_paramsForHooks;
+  bool want = (event == EVENT_OBJECT_SHOW || event == EVENT_SYSTEM_MINIMIZEEND) ? p.get("preDimShow", 1) >= 0.5
+              : event == EVENT_SYSTEM_FOREGROUND                                ? p.get("preDimForeground", 0) >= 0.5
+              : event == EVENT_OBJECT_NAMECHANGE                                ? p.get("preDimTitle", 0) >= 0.5
+                                                                                : false;
+  if (!want || GetAncestor(hwnd, GA_ROOT) != hwnd || !IsWindowVisible(hwnd)) return;
+  BOOL cloaked = FALSE;
+  DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof cloaked);
+  if (cloaked) return;
+  RECT r{};
+  if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof r)) &&
+      !GetWindowRect(hwnd, &r))
+    return;
+  if (r.right <= r.left || r.bottom <= r.top) return;
+  LARGE_INTEGER q;
+  QueryPerformanceCounter(&q);
+  g_preDims.push_back({r, std::chrono::steady_clock::now(), q.QuadPart});
+  if (g_preDims.size() > 8) g_preDims.erase(g_preDims.begin());
+  g_preDimNew = true;
+}
+
+// Worst-case gain for a rect of area fraction `a` on a monitor, assuming it is entirely white:
+// its own neighbourhood budget, and the whole-screen budget spread over it.
+float preDimGainFor(const ParamStore& p, const std::vector<std::pair<double, double>>& curve, double a) {
+  a = std::clamp(a, 1e-7, 1.0);
+  double gain = std::min({1.0, ParamStore::evalCurve(curve, std::log10(a)), ParamStore::evalCurve(curve, 0.0) / a});
+  gain = 1 + (gain - 1) * p.get("strength", 1);
+  return (float)std::max(gain, p.get("minGain", 0.05));
+}
 
 BOOL WINAPI ConsoleHandler(DWORD) {
   g.quit = true;
@@ -172,6 +217,11 @@ HttpResponse handleApi(const std::string& root, ParamStore& params, const HttpRe
     return okOrError(true, "");
   }
 
+  if (req.method == "GET" && p == "/api/probe") {
+    std::lock_guard lk(g.mu);
+    return jsonResponse(g.probe.clone());
+  }
+
   if (req.method == "GET" && p == "/api/profiles") {
     json::Array names;
     for (auto& n : params.listProfiles()) names.push_back(n);
@@ -206,6 +256,8 @@ struct Args {
   bool open = false;
   bool exclude = true;
   bool debugLayer = false;
+  bool vblankPacing = false;  // old loop timing, for A/B latency comparison
+  int probeX = -1, probeY = -1;  // test probe pixel (desktop coordinates)
   std::string profile;
 };
 
@@ -220,6 +272,11 @@ Args parseArgs() {
     else if (s == L"--open") a.open = true;
     else if (s == L"--no-exclude") a.exclude = false;
     else if (s == L"--debug-layer") a.debugLayer = true;
+    else if (s == L"--vblank") a.vblankPacing = true;
+    else if (s == L"--probe" && i + 2 < argc) {
+      a.probeX = _wtoi(argv[++i]);
+      a.probeY = _wtoi(argv[++i]);
+    }
     else if (s == L"--profile" && i + 1 < argc) a.profile = fs::path(argv[++i]).u8string();
   }
   LocalFree(argv);
@@ -261,6 +318,9 @@ bool createGpu(bool debugLayer, Gpu& gpu) {
   ComPtr<IDXGIDevice1> dxgiDev;
   gpu.dev.As(&dxgiDev);
   dxgiDev->SetMaximumFrameLatency(1);
+  // Ask the GPU scheduler to favour our (tiny) workload so the overlay is ready before DWM composes.
+  HRESULT pr = dxgiDev->SetGPUThreadPriority(7);
+  logf("gpu: thread priority 7 %s", SUCCEEDED(pr) ? "set" : "not allowed (needs admin)");
   return SUCCEEDED(DCompositionCreateDevice(dxgiDev.Get(), IID_PPV_ARGS(&gpu.dcomp)));
 }
 
@@ -332,8 +392,22 @@ int main() {
     g.shaderError = err;
   }
 
+  // Capture threads signal this the moment Windows presents a new desktop image.
+  HANDLE wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   auto monitors = buildMonitors(gpu, args.exclude);
+  for (auto& m : monitors) m->startCapture(wake);
   publishMonitors(monitors);
+
+  // The render loop is the rest of the latency chain: real-time-ish priority.
+  DWORD mmTask = 0;
+  HANDLE mmHandle = AvSetMmThreadCharacteristicsW(L"Games", &mmTask);
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+  logf("render thread: MMCSS %s", mmHandle ? "on" : "unavailable");
+  DWM_TIMING_INFO dti{sizeof dti};
+  double refreshMs = 1000.0 / 144;
+  if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &dti)) && dti.rateRefresh.uiNumerator)
+    refreshMs = 1000.0 * dti.rateRefresh.uiDenominator / dti.rateRefresh.uiNumerator;
+  logf("display: composition refresh %.2f ms", refreshMs);
   if (!args.exclude) logf("WARNING: --no-exclude: the overlay is visible to capture (debug only, feedback expected)");
 
   RegisterHotKey(nullptr, kHotBypass, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F12);
@@ -347,6 +421,23 @@ int main() {
     if (req.method != "GET") return jsonResponse(json::Object{{"error", "not found"}}, 404);
     return serveStatic(root, req.path);
   });
+  g_paramsForHooks = &params;
+  HWINEVENTHOOK hooks[] = {
+      SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr, OnWinEvent, 0, 0,
+                      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS),
+      SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, OnWinEvent, 0, 0,
+                      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS),
+      SetWinEventHook(EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZEEND, nullptr, OnWinEvent, 0, 0,
+                      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS),
+      SetWinEventHook(EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE, nullptr, OnWinEvent, 0, 0,
+                      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS),
+  };
+  if (args.probeX >= 0)
+    for (auto& m : monitors)
+      if (args.probeX >= m->desktop.left && args.probeX < m->desktop.right && args.probeY >= m->desktop.top &&
+          args.probeY < m->desktop.bottom)
+        m->enableProbe(args.probeX, args.probeY);
+
   if (args.open) ShellExecuteW(nullptr, L"open", (L"http://127.0.0.1:" + std::to_wstring(args.port) + L"/").c_str(),
                                nullptr, nullptr, SW_SHOWNORMAL);
 
@@ -360,7 +451,7 @@ int main() {
 
   using clock = std::chrono::steady_clock;
   auto start = clock::now(), last = start, lastPoll = start, lastStats = start, lastPreview = start,
-       lastTopmost = start, lastRetry = start;
+       lastTopmost = start;
 
   while (!g.quit) {
     MSG msg;
@@ -388,6 +479,7 @@ int main() {
       monitors.clear();
       Sleep(500);
       monitors = buildMonitors(gpu, args.exclude);
+      for (auto& m : monitors) m->startCapture(wake);
       publishMonitors(monitors);
     }
 
@@ -453,19 +545,44 @@ int main() {
     bool colorChanged = memcmp(colorNow, lastColor, sizeof lastColor) != 0;
     memcpy(lastColor, colorNow, sizeof lastColor);
     in.force = force || in.resetTemporal || colorChanged;
+    in.minIntervalMs = (float)(refreshMs * 0.8);
     in.settleMs = (float)(std::max(params.get("attackMs", 0), params.get("releaseMs", 500)) * 7 + 250);
 
-    // Capture + process each monitor.
-    bool retry = now - lastRetry > std::chrono::milliseconds(500);
-    if (retry) lastRetry = now;
-    for (auto& m : monitors) {
-      if (m->lost()) {
-        if (retry) m->reacquire();
-        continue;
+    // Start protected: active pre-dims (hold, then fade out once real measurements have taken over).
+    {
+      double hold = params.get("preDimHoldMs", 120), fade = std::max(1.0, params.get("preDimFadeMs", 80));
+      double minArea = params.get("preDimMinArea", 0.05);
+      g_preDims.erase(std::remove_if(g_preDims.begin(), g_preDims.end(),
+                                     [&](const PreDimEvent& e) {
+                                       return std::chrono::duration<double, std::milli>(now - e.t).count() > hold + fade;
+                                     }),
+                      g_preDims.end());
+      for (auto& m : monitors) {
+        RECT rects[4];
+        float gains[4];
+        int n = 0;
+        double monArea = (double)m->width * m->height;
+        for (auto it = g_preDims.rbegin(); it != g_preDims.rend() && n < 4; ++it) {
+          RECT r;
+          if (!IntersectRect(&r, &it->rect, &m->desktop)) continue;
+          double a = (double)(r.right - r.left) * (r.bottom - r.top) / monArea;
+          if (a < minArea) continue;
+          double age = std::chrono::duration<double, std::milli>(now - it->t).count();
+          double f = age < hold ? 1 : 1 - (age - hold) / fade;
+          float g0 = preDimGainFor(params, in.curve, a);
+          rects[n] = r;
+          gains[n] = (float)(1 + (g0 - 1) * std::clamp(f, 0.0, 1.0));
+          n++;
+        }
+        m->setPreDim(rects, gains, in.bypass ? 0 : n);
       }
-      bool fresh = m->capture();
-      m->process(in, fresh);
+      if (!g_preDims.empty()) in.force = true;  // render immediately and keep fading
+      g_preDimNew = false;
     }
+
+    // Process each monitor with its newest captured image (capture runs on its own threads).
+    bool animating = false;
+    for (auto& m : monitors) animating |= m->process(in);
 
     // Stats for the meters (5 Hz).
     if (now - lastStats > std::chrono::milliseconds(200)) {
@@ -474,9 +591,32 @@ int main() {
       for (auto& m : monitors) {
         MonitorStats s;
         m->readStats(in, s);
-        arr.push_back(json::Object{{"index", m->index}, {"fps", s.fps}, {"frameMs", s.frameMs}, {"inMean", s.inMean},
+        arr.push_back(json::Object{{"index", m->index}, {"fps", s.fps}, {"frameMs", s.frameMs},
+                                   {"latMs", s.latMs}, {"latMaxMs", s.latMaxMs}, {"acqMs", s.acqMs},
+                                   {"refreshMs", refreshMs}, {"inMean", s.inMean},
                                    {"outMean", s.outMean}, {"minGain", s.minGain}, {"brightMean", s.brightMean},
                                    {"lost", m->lost()}});
+      }
+      if (args.probeX >= 0) {
+        static const double qpcPerMs = [] {
+          LARGE_INTEGER f;
+          QueryPerformanceFrequency(&f);
+          return f.QuadPart / 1000.0;
+        }();
+        json::Array samples, events;
+        for (auto& m : monitors)
+          for (auto& s : m->probeSamples())
+            samples.push_back(json::Array{s.qpc / qpcPerMs, (double)s.r, (double)s.g, (double)s.b});
+        for (auto& e : g_preDims) events.push_back(e.qpc / qpcPerMs);
+        std::lock_guard lk(g.mu);
+        (*g.probe.o)["samples"] = json::Value(std::move(samples));
+        auto& ev = (*g.probe.o)["preDimEvents"];
+        if (!ev.isArr()) ev = json::Array{};
+        for (auto& e : events) {
+          bool seen = false;
+          for (auto& x : *ev.a) seen |= x.num() == e.num();
+          if (!seen) ev.a->push_back(e);
+        }
       }
       std::lock_guard lk(g.mu);
       g.stats = json::Object{{"monitors", arr},
@@ -497,12 +637,12 @@ int main() {
       }
       if (wanted && mon >= 0 && mon < (int)monitors.size()) {
         std::vector<uint8_t> rgba, jpg;
-        int w = 0, h = 0;
-        if (monitors[mon]->readPreview(in, mode, rgba, w, h) && encodeJpeg(rgba, w, h, 0.8f, jpg)) {
+        int w = 0, h = 0, gotMode = mode;
+        if (monitors[mon]->readPreview(in, mode, rgba, w, h, gotMode) && encodeJpeg(rgba, w, h, 0.8f, jpg)) {
           std::lock_guard lk(g.mu);
           g.previewJpeg.assign(jpg.begin(), jpg.end());
           g.previewJpegMon = mon;
-          g.previewJpegMode = mode;
+          g.previewJpegMode = gotMode;
         }
       }
     }
@@ -513,12 +653,23 @@ int main() {
     }
 
     // Pace to the display: wait for the primary monitor's vblank.
-    if (monitors.empty() || !monitors[0]->waitVBlank()) Sleep(7);
+    // Sleep until a capture thread has a new frame (or a message arrives). While the temporal
+    // state is still animating, also wake once per refresh; otherwise idle cheaply.
+    if (args.vblankPacing) {
+      if (monitors.empty() || !monitors[0]->waitVBlank()) Sleep(7);
+    } else {
+      DWORD timeout = animating ? (DWORD)std::max(1.0, refreshMs) : 25;
+      MsgWaitForMultipleObjectsEx(1, &wake, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    }
   }
 
   logf("shutting down");
   http.stop();
+  for (auto h : hooks)
+    if (h) UnhookWinEvent(h);
   monitors.clear();
+  CloseHandle(wake);
+  if (mmHandle) AvRevertMmThreadCharacteristics(mmHandle);
   timeEndPeriod(1);
   return 0;
 }

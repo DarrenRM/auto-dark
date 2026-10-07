@@ -1188,9 +1188,13 @@ function applyStats(st) {
     const els = S.meterEls.get(m.index);
     if (!els) continue;
     const fps = num(m.fps, NaN), ms = num(m.frameMs, NaN);
+    const lat = num(m.latMs, NaN), latMax = num(m.latMaxMs, NaN);
     els.perf.replaceChildren(
       h('b', { text: Number.isFinite(fps) ? fps.toFixed(1) : '—' }), ' fps  ',
-      h('b', { text: Number.isFinite(ms) ? ms.toFixed(2) : '—' }), ' ms');
+      h('b', { text: Number.isFinite(ms) ? ms.toFixed(2) : '—' }), ' ms  lag ',
+      h('b', { text: Number.isFinite(lat) && lat > 0 ? lat.toFixed(1) : '—' }),
+      Number.isFinite(latMax) && latMax > 0 ? ` (max ${latMax.toFixed(1)})` : '', ' ms');
+    els.perf.title = 'lag: time from Windows presenting a desktop frame to our overlay being presented for it';
     const inM = num(m.inMean, NaN), outM = num(m.outMean, NaN), g = num(m.minGain, NaN);
     els.fin.style.height = `${(Number.isFinite(inM) ? meterFrac(inM) : 0) * 100}%`;
     els.fout.style.height = `${(Number.isFinite(outM) ? meterFrac(outM) : 0) * 100}%`;

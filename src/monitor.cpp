@@ -21,6 +21,8 @@ struct FrameCB {
   float levels[4];
   float colorM[12];
   float colorCtl[4];
+  float preDim[16];
+  float preDimGain[4];
 };
 struct PassCB {
   float a[4];
@@ -62,6 +64,7 @@ std::string narrow(const wchar_t* w) {
 }  // namespace
 
 Monitor::~Monitor() {
+  stopCapture();
   if (dupl_) dupl_.Reset();
   visual_.Reset();
   target_.Reset();
@@ -90,9 +93,10 @@ bool Monitor::init(IDXGIOutput* output, int idx, bool excludeFromCapture, std::s
     logf("monitor %s: rotated outputs are not handled yet", name.c_str());
 
   if (!createResources(err)) return false;
+  if (!createCaptureDevice(err)) return false;
   if (!createWindow(excludeFromCapture, err)) return false;
   if (!reacquire()) {
-    // Not fatal: the secure desktop may be active. The main loop keeps retrying.
+    // Not fatal: the secure desktop may be active. The capture thread keeps retrying.
     logf("monitor %s: duplication not available yet", name.c_str());
   }
   logf("monitor %d: %s %dx%d at (%ld,%ld)%s, %d levels, capture-excluded=%d", index, name.c_str(), width, height,
@@ -102,10 +106,103 @@ bool Monitor::init(IDXGIOutput* output, int idx, bool excludeFromCapture, std::s
 
 bool Monitor::reacquire() {
   dupl_.Reset();
-  HRESULT hr = output_->DuplicateOutput(dev_, &dupl_);
+  HRESULT hr = output_->DuplicateOutput(capDev_.Get(), &dupl_);
   lost_ = FAILED(hr);
   if (!lost_) hasFrame_ = false;
   return !lost_;
+}
+
+bool Monitor::createCaptureDevice(std::string& err) {
+  ComPtr<IDXGIAdapter> adapter;
+  output_->GetParent(IID_PPV_ARGS(&adapter));
+  D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+  if (FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                               levels, 2, D3D11_SDK_VERSION, &capDev_, nullptr, &capCtx_))) {
+    err = "capture device";
+    return false;
+  }
+  D3D11_TEXTURE2D_DESC td{};
+  td.Width = width;
+  td.Height = height;
+  td.MipLevels = 1;
+  td.ArraySize = 1;
+  td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  td.SampleDesc.Count = 1;
+  td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+  td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+  ComPtr<IDXGIResource> res;
+  HANDLE shared = nullptr;
+  if (FAILED(capDev_->CreateTexture2D(&td, nullptr, &capShared_)) || FAILED(capShared_.As(&res)) ||
+      FAILED(res->GetSharedHandle(&shared)) ||
+      FAILED(dev_->OpenSharedResource(shared, IID_PPV_ARGS(&captureTex_))) || FAILED(capShared_.As(&capMutex_)) ||
+      FAILED(captureTex_.As(&mainMutex_))) {
+    err = "shared capture texture";
+    return false;
+  }
+  return true;
+}
+
+void Monitor::startCapture(HANDLE wake) {
+  wake_ = wake;
+  capRun_ = true;
+  capThread_ = std::thread([this] { captureLoop(); });
+}
+
+void Monitor::stopCapture() {
+  if (!capRun_.exchange(false)) return;
+  if (capThread_.joinable()) capThread_.join();
+}
+
+void Monitor::captureLoop() {
+  // Capture is the start of the latency chain: run it at high priority.
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+  while (capRun_) {
+    if (!dupl_) {
+      if (!reacquire()) {
+        Sleep(250);
+        continue;
+      }
+    }
+    DXGI_OUTDUPL_FRAME_INFO fi{};
+    ComPtr<IDXGIResource> res;
+    // Blocks until Windows presents a new desktop image (short timeout so stop requests are seen).
+    HRESULT hr = dupl_->AcquireNextFrame(100, &fi, &res);
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
+    if (FAILED(hr)) {
+      dupl_.Reset();
+      lost_ = true;
+      continue;
+    }
+    bool changed = fi.LastPresentTime.QuadPart != 0 && fi.TotalMetadataBufferSize > 0;
+    if (changed || !hasFrame_) {
+      ComPtr<ID3D11Texture2D> tex;
+      if (SUCCEEDED(res.As(&tex))) {
+        D3D11_TEXTURE2D_DESC d{};
+        tex->GetDesc(&d);
+        if ((int)d.Width == width && (int)d.Height == height && d.Format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+          // Hand the frame over. If the render thread hasn't taken the previous one yet, wait
+          // briefly (it consumes on wake); never indefinitely.
+          if (capMutex_->AcquireSync(0, 50) != S_OK) {
+            dupl_->ReleaseFrame();
+            continue;
+          }
+          capCtx_->CopyResource(capShared_.Get(), tex.Get());
+          capMutex_->ReleaseSync(1);
+          LARGE_INTEGER now;
+          QueryPerformanceCounter(&now);
+          if (probeOn_) sampleProbe(tex.Get(), fi.LastPresentTime.QuadPart ? fi.LastPresentTime.QuadPart : now.QuadPart);
+          framePresentQpc_ = fi.LastPresentTime.QuadPart ? fi.LastPresentTime.QuadPart : now.QuadPart;
+          frameAcquireQpc_ = now.QuadPart;
+          hasFrame_ = true;
+          newFrame_ = true;
+          SetEvent(wake_);
+        } else {
+          g_displayChanged = true;  // size/format mismatch: rebuild
+        }
+      }
+    }
+    dupl_->ReleaseFrame();
+  }
 }
 
 bool Monitor::createWindow(bool excludeFromCapture, std::string& err) {
@@ -275,35 +372,6 @@ bool Monitor::ensureState(int level) {
   return true;
 }
 
-bool Monitor::capture() {
-  if (!dupl_ || lost_) return false;
-  DXGI_OUTDUPL_FRAME_INFO fi{};
-  ComPtr<IDXGIResource> res;
-  HRESULT hr = dupl_->AcquireNextFrame(0, &fi, &res);
-  if (hr == DXGI_ERROR_WAIT_TIMEOUT) return false;
-  if (FAILED(hr)) {
-    lost_ = true;
-    return false;
-  }
-  bool got = false;
-  if (fi.LastPresentTime.QuadPart != 0 || !hasFrame_) {
-    ComPtr<ID3D11Texture2D> tex;
-    if (SUCCEEDED(res.As(&tex))) {
-      D3D11_TEXTURE2D_DESC d{};
-      tex->GetDesc(&d);
-      if ((int)d.Width == width && (int)d.Height == height && d.Format == DXGI_FORMAT_B8G8R8A8_UNORM) {
-        ctx_->CopyResource(frameTex_.Get(), tex.Get());
-        got = true;
-        hasFrame_ = true;
-      } else {
-        g_displayChanged = true;  // size/format mismatch: rebuild
-      }
-    }
-  }
-  dupl_->ReleaseFrame();
-  return got;
-}
-
 void Monitor::setFrameCB(const FrameInputs& in, int kmin, int kmax, int previewMode) {
   D3D11_MAPPED_SUBRESOURCE m;
   if (FAILED(ctx_->Map(frameCB_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
@@ -327,6 +395,8 @@ void Monitor::setFrameCB(const FrameInputs& in, int kmin, int kmax, int previewM
   cb.levels[3] = (float)previewMode;
   memcpy(cb.colorM, in.colorM, sizeof cb.colorM);
   memcpy(cb.colorCtl, in.colorCtl, sizeof cb.colorCtl);
+  memcpy(cb.preDim, preDim_, sizeof cb.preDim);
+  memcpy(cb.preDimGain, preDimGain_, sizeof cb.preDimGain);
   memcpy(m.pData, &cb, sizeof cb);
   ctx_->Unmap(frameCB_.Get(), 0);
 }
@@ -400,21 +470,42 @@ void Monitor::runPipeline(const FrameInputs& in, int kmin, int kmax) {
   stateFresh_ = false;
 }
 
-void Monitor::process(const FrameInputs& in, bool newFrame) {
-  if (!in.shaders || !hasFrame_) return;
+bool Monitor::process(const FrameInputs& in) {
+  if (!in.shaders || !hasFrame_) return false;
+  bool newFrame = newFrame_.exchange(false);
+  int64_t framePresent = framePresentQpc_, frameAcquire = frameAcquireQpc_;
+  if (newFrame) {
+    // Non-blocking: if the hand-over isn't ready this instant, try again on the next wake.
+    if (mainMutex_->AcquireSync(1, 0) == S_OK) {
+      ctx_->CopyResource(frameTex_.Get(), captureTex_.Get());
+      mainMutex_->ReleaseSync(0);
+    } else {
+      newFrame_ = true;
+      newFrame = false;
+    }
+  }
   auto now = std::chrono::steady_clock::now();
   double win = std::chrono::duration<double>(now - fpsWindow_).count();
   if (win >= 1.0) {
     stats.fps = frameCount_ / win;
     stats.frameMs = frameCount_ ? frameMsAccum_ / frameCount_ : 0;
-    frameCount_ = 0;
-    frameMsAccum_ = 0;
+    stats.latMs = latCount_ ? latAccum_ / latCount_ : 0;
+    stats.acqMs = latCount_ ? acqAccum_ / latCount_ : 0;
+    stats.latMaxMs = latMax_;
+    frameCount_ = latCount_ = 0;
+    frameMsAccum_ = latAccum_ = acqAccum_ = latMax_ = 0;
     fpsWindow_ = now;
   }
   if (newFrame || in.force || in.bypass != lastBypass_ || !processedOnce_) lastActivity_ = now;
   // Idle: nothing changed and the temporal state has had time to settle.
   double idleMs = std::chrono::duration<double, std::milli>(now - lastActivity_).count();
-  if (idleMs > in.settleMs) return;
+  if (idleMs > in.settleMs) return false;
+  // Only this monitor's own new frames (or param changes) trigger immediate work; otherwise the
+  // temporal state just needs updating about once per refresh.
+  if (!newFrame && !in.force &&
+      std::chrono::duration<double, std::milli>(now - lastProcess_).count() < in.minIntervalMs)
+    return true;
+  lastProcess_ = now;
 
   int kmax = std::clamp(in.maxLevel, 0, numLevels - 1);
   int kmin = std::clamp(in.minLevel, 0, kmax);
@@ -444,15 +535,48 @@ void Monitor::process(const FrameInputs& in, bool newFrame) {
 
   swap_->Present(0, 0);
   processedOnce_ = true;
+  if (newFrame) {
+    static const double qpcPerMs = [] {
+      LARGE_INTEGER f;
+      QueryPerformanceFrequency(&f);
+      return f.QuadPart / 1000.0;
+    }();
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    double lat = (q.QuadPart - framePresent) / qpcPerMs;
+    latAccum_ += lat;
+    acqAccum_ += (frameAcquire - framePresent) / qpcPerMs;
+    latMax_ = std::max(latMax_, lat);
+    latCount_++;
+  }
   lastBypass_ = in.bypass;
 
   double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - now).count();
   frameCount_++;
   frameMsAccum_ += ms;
+  return true;
 }
 
-bool Monitor::readPreview(const FrameInputs& in, int mode, std::vector<uint8_t>& rgba, int& w, int& h) {
+bool Monitor::readPreview(const FrameInputs& in, int mode, std::vector<uint8_t>& rgba, int& w, int& h,
+                          int& resultMode) {
   if (!in.shaders || !processedOnce_ || !stateTex_) return false;
+  bool got = false;
+  if (previewPending_) {
+    D3D11_MAPPED_SUBRESOURCE m;
+    HRESULT hr = ctx_->Map(previewStaging_.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return false;  // not ready: try next tick
+    if (SUCCEEDED(hr)) {
+      w = previewW_;
+      h = previewH_;
+      rgba.resize((size_t)w * h * 4);
+      for (int y = 0; y < h; y++)
+        memcpy(&rgba[(size_t)y * w * 4], (uint8_t*)m.pData + (size_t)y * m.RowPitch, (size_t)w * 4);
+      ctx_->Unmap(previewStaging_.Get(), 0);
+      resultMode = previewPendingMode_;
+      got = true;
+    }
+    previewPending_ = false;
+  }
   setFrameCB(in, lastKmin_, lastKmax_, mode);
   bindCommon(in);
   ctx_->CSSetShader(in.shaders->preview.Get(), nullptr, 0);
@@ -463,19 +587,39 @@ bool Monitor::readPreview(const FrameInputs& in, int mode, std::vector<uint8_t>&
   ctx_->Dispatch(groups(previewW_, 8), groups(previewH_, 8), 1);
   unbindCS(ctx_);
   ctx_->CopyResource(previewStaging_.Get(), previewTex_.Get());
-  D3D11_MAPPED_SUBRESOURCE m;
-  if (FAILED(ctx_->Map(previewStaging_.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
-  w = previewW_;
-  h = previewH_;
-  rgba.resize((size_t)w * h * 4);
-  for (int y = 0; y < h; y++) memcpy(&rgba[(size_t)y * w * 4], (uint8_t*)m.pData + (size_t)y * m.RowPitch, (size_t)w * 4);
-  ctx_->Unmap(previewStaging_.Get(), 0);
-  return true;
+  previewPending_ = true;
+  previewPendingMode_ = mode;
+  return got;
 }
 
 bool Monitor::readStats(const FrameInputs& in, MonitorStats& out) {
   out = stats;
   if (!in.shaders || !processedOnce_ || !stateTex_) return false;
+  if (statsPending_) {
+    D3D11_MAPPED_SUBRESOURCE m;
+    HRESULT hr = ctx_->Map(statsStaging_.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return false;
+    if (SUCCEEDED(hr)) {
+      double sumIn = 0, sumOut = 0, sumE = 0, minG = 1;
+      for (int y = 0; y < kStatsH; y++) {
+        const float* row = (const float*)((uint8_t*)m.pData + (size_t)y * m.RowPitch);
+        for (int x = 0; x < kStatsW; x++) {
+          sumIn += row[x * 4 + 0];
+          sumOut += row[x * 4 + 1];
+          minG = std::min(minG, (double)row[x * 4 + 2]);
+          sumE += row[x * 4 + 3];
+        }
+      }
+      ctx_->Unmap(statsStaging_.Get(), 0);
+      double n = kStatsW * kStatsH;
+      stats.inMean = sumIn / n;
+      stats.outMean = sumOut / n;
+      stats.brightMean = sumE / n;
+      stats.minGain = minG;
+      out = stats;
+    }
+    statsPending_ = false;
+  }
   setFrameCB(in, lastKmin_, lastKmax_, 0);
   int level = std::clamp((int)std::floor(std::log2((double)width / kStatsW)), 0, numLevels - 1);
   setPassCB((float)level, 0, 0, 0, 0, 0, 0);
@@ -488,26 +632,56 @@ bool Monitor::readStats(const FrameInputs& in, MonitorStats& out) {
   ctx_->Dispatch(groups(kStatsW, 8), groups(kStatsH, 8), 1);
   unbindCS(ctx_);
   ctx_->CopyResource(statsStaging_.Get(), statsTex_.Get());
-  D3D11_MAPPED_SUBRESOURCE m;
-  if (FAILED(ctx_->Map(statsStaging_.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
-  double sumIn = 0, sumOut = 0, sumE = 0, minG = 1;
-  for (int y = 0; y < kStatsH; y++) {
-    const float* row = (const float*)((uint8_t*)m.pData + (size_t)y * m.RowPitch);
-    for (int x = 0; x < kStatsW; x++) {
-      sumIn += row[x * 4 + 0];
-      sumOut += row[x * 4 + 1];
-      minG = std::min(minG, (double)row[x * 4 + 2]);
-      sumE += row[x * 4 + 3];
+  statsPending_ = true;
+  return true;
+}
+
+void Monitor::setPreDim(const RECT* rects, const float* gains, int count) {
+  for (int i = 0; i < 4; i++) {
+    if (i < count) {
+      preDim_[i][0] = (float)(rects[i].left - desktop.left) / width;
+      preDim_[i][1] = (float)(rects[i].top - desktop.top) / height;
+      preDim_[i][2] = (float)(rects[i].right - desktop.left) / width;
+      preDim_[i][3] = (float)(rects[i].bottom - desktop.top) / height;
+      preDimGain_[i] = gains[i];
+    } else {
+      preDimGain_[i] = 1;
     }
   }
-  ctx_->Unmap(statsStaging_.Get(), 0);
-  double n = kStatsW * kStatsH;
-  stats.inMean = sumIn / n;
-  stats.outMean = sumOut / n;
-  stats.brightMean = sumE / n;
-  stats.minGain = minG;
-  out = stats;
-  return true;
+}
+
+void Monitor::enableProbe(int x, int y) {
+  probeOn_ = true;
+  probeX_ = x - desktop.left;
+  probeY_ = y - desktop.top;
+  D3D11_TEXTURE2D_DESC td{};
+  td.Width = td.Height = 1;
+  td.MipLevels = td.ArraySize = 1;
+  td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  td.SampleDesc.Count = 1;
+  td.Usage = D3D11_USAGE_STAGING;
+  td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  capDev_->CreateTexture2D(&td, nullptr, &probeStaging_);
+  logf("probe: monitor %d pixel (%d,%d)", index, probeX_, probeY_);
+}
+
+void Monitor::sampleProbe(ID3D11Texture2D* desktopTex, int64_t qpc) {
+  if (!probeStaging_) return;
+  D3D11_BOX box{(UINT)probeX_, (UINT)probeY_, 0, (UINT)probeX_ + 1, (UINT)probeY_ + 1, 1};
+  capCtx_->CopySubresourceRegion(probeStaging_.Get(), 0, 0, 0, 0, desktopTex, 0, &box);
+  D3D11_MAPPED_SUBRESOURCE m;
+  if (FAILED(capCtx_->Map(probeStaging_.Get(), 0, D3D11_MAP_READ, 0, &m))) return;
+  const uint8_t* p = (const uint8_t*)m.pData;
+  ProbeSample s{qpc, p[2], p[1], p[0]};
+  capCtx_->Unmap(probeStaging_.Get(), 0);
+  std::lock_guard lk(probeMu_);
+  probe_.push_back(s);
+  if (probe_.size() > 2000) probe_.erase(probe_.begin(), probe_.begin() + 1000);
+}
+
+std::vector<Monitor::ProbeSample> Monitor::probeSamples() {
+  std::lock_guard lk(probeMu_);
+  return probe_;
 }
 
 void Monitor::reassertTopmost() {

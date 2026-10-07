@@ -168,7 +168,7 @@ void dumpTo(std::string& out, const Value& v, bool pretty, int indent) {
       char buf[32];
       if (v.n == 0) snprintf(buf, sizeof buf, "0");
       else if (v.n == std::floor(v.n) && std::fabs(v.n) < 1e15) snprintf(buf, sizeof buf, "%.0f", v.n);
-      else snprintf(buf, sizeof buf, "%.6g", v.n);
+      else snprintf(buf, sizeof buf, "%.12g", v.n);  // enough for QPC-based ms timestamps
       out += buf;
       break;
     }

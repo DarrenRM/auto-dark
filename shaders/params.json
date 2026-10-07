@@ -4,6 +4,7 @@
     {"id": "budget", "label": "Budget", "help": "Allowed mean brightness versus the size of the bright area."},
     {"id": "response", "label": "Response", "help": "How the required dimming is applied."},
     {"id": "timing", "label": "Timing", "help": "How fast dimming engages and releases."},
+    {"id": "protect", "label": "Start protected", "help": "Dim a window the instant it appears, before its first frame can be measured, then hand over to the measured result. Beats the overlay's capture lag for new windows."},
     {"id": "color", "label": "Treated-area color", "help": "Color recipe applied only where the guard is dimming, scaled by how hard it dims and by time of day. Stacks on top of f.lux. Bypass turns it off too."},
     {"id": "schedule", "label": "Sun schedule", "help": "Time-of-day phases used when Treated-area color is set to Sun schedule."},
     {"id": "debug", "label": "Debug view", "help": "Visualisations drawn on the real desktop."}
@@ -42,6 +43,19 @@
       "help": "Time constant for dimming down. 0 = instant (recommended)." },
     {"id": "releaseMs", "label": "Release", "group": "timing", "type": "float", "min": 0, "max": 5000, "step": 10, "default": 500, "format": "ms",
       "help": "Time constant for brightening back up once content gets darker." },
+
+    {"id": "preDimShow", "label": "New / restored windows", "group": "protect", "type": "enum", "options": ["Off", "On"], "default": 1,
+      "help": "Pre-dim a window when it is shown or restored from minimized." },
+    {"id": "preDimForeground", "label": "Activated windows", "group": "protect", "type": "enum", "options": ["Off", "On"], "default": 0,
+      "help": "Also pre-dim on every foreground switch (Alt+Tab, clicks). Catches covered windows coming to the front, but dips dark windows briefly." },
+    {"id": "preDimTitle", "label": "Title changes", "group": "protect", "type": "enum", "options": ["Off", "On"], "default": 0,
+      "help": "Pre-dim a window when its title changes, which catches most browser tab switches and navigations. Dips dark pages briefly." },
+    {"id": "preDimHoldMs", "label": "Hold", "group": "protect", "type": "float", "min": 0, "max": 500, "step": 5, "default": 120, "format": "ms",
+      "help": "How long the pre-dim stays fully on (measurement takes over within a couple of frames)." },
+    {"id": "preDimFadeMs", "label": "Fade", "group": "protect", "type": "float", "min": 0, "max": 500, "step": 5, "default": 80, "format": "ms",
+      "help": "Fade-out after the hold. A dark window recovers over this time." },
+    {"id": "preDimMinArea", "label": "Min window size", "group": "protect", "type": "float", "min": 0, "max": 0.5, "step": 0.005, "default": 0.05, "format": "percent",
+      "help": "Ignore windows smaller than this fraction of the monitor (menus, tooltips)." },
 
     {"id": "colorEnabled", "label": "Color", "group": "color", "type": "enum", "options": ["Off", "On"], "default": 1,
       "help": "Quick A/B switch for the treated-area color." },

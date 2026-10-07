@@ -12,7 +12,19 @@ cbuffer Frame : register(b0) {
   float4 gLevels;     // minLevel, maxLevel, numLevels, previewMode
   float4 gColorM[3];  // treated-area color recipe, rows of a 3x3 matrix (encoded space)
   float4 gColorCtl;   // time-of-day amount, enabled
+  float4 gPreDim[4];  // "start protected" rects (uv x0, y0, x1, y1) for just-shown windows
+  float4 gPreDimGain; // linear gain per rect (1 = inactive)
 };
+
+// Strongest pre-dim covering uv (1 = none).
+float PreDimGain(float2 uv) {
+  float gp = 1;
+  [unroll] for (int r = 0; r < 4; r++) {
+    float4 R = gPreDim[r];
+    if (uv.x >= R.x && uv.y >= R.y && uv.x < R.z && uv.y < R.w) gp = min(gp, gPreDimGain[r]);
+  }
+  return gp;
+}
 
 cbuffer PassConsts : register(b2) {
   float4 gPassA;      // level, isTop, levelWidth, levelHeight

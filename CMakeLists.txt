@@ -25,4 +25,4 @@ if(MSVC)
 endif()
 
 target_link_libraries(auto-dark PRIVATE
-  d3d11 dxgi d3dcompiler dcomp dwmapi ws2_32 windowscodecs ole32 shcore winmm)
+  d3d11 dxgi d3dcompiler dcomp dwmapi ws2_32 windowscodecs ole32 shcore winmm avrt)
