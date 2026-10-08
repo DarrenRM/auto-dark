@@ -51,6 +51,8 @@ struct Shared {
   std::atomic<bool> quit{false};
   std::atomic<int> panelRequest{0};  // 1 = start/open the tuning panel, 2 = stop it (from the tray)
   std::atomic<bool> panelRunning{false};
+  // Test hooks for the recovery paths (/api/control).
+  std::atomic<bool> simulateDeviceLoss{false}, simulateCaptureLoss{false};
   // preview: requested by the UI, rendered by the render thread
   int previewMon = 0, previewMode = 0;
   std::chrono::steady_clock::time_point previewRequested{};
@@ -273,6 +275,8 @@ HttpResponse handleApi(const std::string& root, ParamStore& params, const HttpRe
       logf("bypass %s (web)", g.bypass ? "ON" : "off");
     }
     if (body.has("resetTemporal")) g.resetTemporal = true;
+    if (body.has("simulateDeviceLoss")) g.simulateDeviceLoss = true;
+    if (body.has("simulateCaptureLoss")) g.simulateCaptureLoss = true;
     if (body.has("quit") && body["quit"].num() != 0) g.quit = true;
     return okOrError(true, "");
   }
@@ -540,7 +544,7 @@ int main() {
 
   using clock = std::chrono::steady_clock;
   auto start = clock::now(), last = start, lastPoll = start, lastStats = start, lastPreview = start,
-       lastTopmost = start;
+       lastTopmost = start, lastHealth = start;
 
   while (!g.quit) {
     // Tray requests for the tuning panel.
@@ -568,9 +572,34 @@ int main() {
 
     auto now = clock::now();
 
-    if (g_displayChanged) {
+    // Render device health (cheap; every half second): a removed device would freeze the overlay.
+    if (now - lastHealth > std::chrono::milliseconds(500)) {
+      lastHealth = now;
+      HRESULT dr = gpu.dev->GetDeviceRemovedReason();
+      if (FAILED(dr)) {
+        logf("gpu: render device removed (0x%08lx)", (unsigned long)dr);
+        g_deviceLost = true;
+      }
+    }
+    if (g_deviceLost || g.simulateDeviceLoss.exchange(false)) {
+      g_deviceLost = false;
+      logf("gpu: recreating devices, shaders and monitors");
+      monitors.clear();
+      paramsCB.Reset();
+      paramsShaderSet = nullptr;
+      gpu = Gpu{};
+      while (!createGpu(args.debugLayer, gpu) && !g.quit) {
+        logf("gpu: device creation failed, retrying");
+        Sleep(1000);
+      }
+      std::string err;
+      if (!shaders.compile(gpu.dev.Get(), err)) logf("shaders: %s", err.c_str());
+      g_displayChanged = true;  // rebuild monitors on the new device below
+    }
+
+    if (g_displayChanged || g.simulateCaptureLoss.exchange(false)) {
       g_displayChanged = false;
-      logf("display configuration changed; rebuilding monitors");
+      logf("display/capture changed; rebuilding monitors");
       monitors.clear();
       Sleep(500);
       monitors = buildMonitors(gpu, args.exclude);

@@ -7,6 +7,7 @@
 #include "log.h"
 
 volatile bool g_displayChanged = false;
+volatile bool g_deviceLost = false;
 
 namespace {
 
@@ -167,10 +168,26 @@ void Monitor::captureLoop() {
     ComPtr<IDXGIResource> res;
     // Blocks until Windows presents a new desktop image (short timeout so stop requests are seen).
     HRESULT hr = dupl_->AcquireNextFrame(100, &fi, &res);
-    if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+      // Quiet desktop: still make sure our capture device is healthy (a silently removed device
+      // would otherwise keep "delivering" the last image forever).
+      if (FAILED(capDev_->GetDeviceRemovedReason())) {
+        logf("monitor %d: capture device removed (0x%08lx); rebuilding", index, capDev_->GetDeviceRemovedReason());
+        g_displayChanged = true;
+        Sleep(200);
+      }
+      continue;
+    }
     if (FAILED(hr)) {
+      logf("monitor %d: capture lost (0x%08lx), reacquiring", index, (unsigned long)hr);
       dupl_.Reset();
       lost_ = true;
+      if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
+          FAILED(capDev_->GetDeviceRemovedReason())) {
+        logf("monitor %d: capture device removed; rebuilding", index);
+        g_displayChanged = true;
+        Sleep(200);
+      }
       continue;
     }
     bool changed = fi.LastPresentTime.QuadPart != 0 && fi.TotalMetadataBufferSize > 0;
@@ -182,12 +199,24 @@ void Monitor::captureLoop() {
         if ((int)d.Width == width && (int)d.Height == height && d.Format == DXGI_FORMAT_B8G8R8A8_UNORM) {
           // Hand the frame over. If the render thread hasn't taken the previous one yet, wait
           // briefly (it consumes on wake); never indefinitely.
-          if (capMutex_->AcquireSync(0, 50) != S_OK) {
+          HRESULT sync = capMutex_->AcquireSync(0, 50);
+          if (sync != S_OK) {
+            if (sync != (HRESULT)WAIT_TIMEOUT) {  // abandoned / failed: the hand-over is broken
+              logf("monitor %d: frame hand-over failed (0x%08lx); rebuilding", index, (unsigned long)sync);
+              g_displayChanged = true;
+            }
             dupl_->ReleaseFrame();
             continue;
           }
           capCtx_->CopyResource(capShared_.Get(), tex.Get());
           capMutex_->ReleaseSync(1);
+          if (FAILED(capDev_->GetDeviceRemovedReason())) {
+            logf("monitor %d: capture device removed (0x%08lx); rebuilding", index, capDev_->GetDeviceRemovedReason());
+            g_displayChanged = true;
+            dupl_->ReleaseFrame();
+            Sleep(200);
+            continue;
+          }
           LARGE_INTEGER now;
           QueryPerformanceCounter(&now);
           if (probeOn_) sampleProbe(tex.Get(), fi.LastPresentTime.QuadPart ? fi.LastPresentTime.QuadPart : now.QuadPart);
@@ -476,10 +505,15 @@ bool Monitor::process(const FrameInputs& in) {
   int64_t framePresent = framePresentQpc_, frameAcquire = frameAcquireQpc_;
   if (newFrame) {
     // Non-blocking: if the hand-over isn't ready this instant, try again on the next wake.
-    if (mainMutex_->AcquireSync(1, 0) == S_OK) {
+    HRESULT sync = mainMutex_->AcquireSync(1, 0);
+    if (sync == S_OK) {
       ctx_->CopyResource(frameTex_.Get(), captureTex_.Get());
       mainMutex_->ReleaseSync(0);
     } else {
+      if (sync != (HRESULT)WAIT_TIMEOUT) {
+        logf("monitor %d: frame hand-over failed on render side (0x%08lx); rebuilding", index, (unsigned long)sync);
+        g_displayChanged = true;
+      }
       newFrame_ = true;
       newFrame = false;
     }
@@ -533,7 +567,11 @@ bool Monitor::process(const FrameInputs& in) {
   ctx_->PSSetShaderResources(0, 3, nullSRV);
   ctx_->OMSetRenderTargets(0, nullptr, nullptr);
 
-  swap_->Present(0, 0);
+  HRESULT pr = swap_->Present(0, 0);
+  if (pr == DXGI_ERROR_DEVICE_REMOVED || pr == DXGI_ERROR_DEVICE_RESET) {
+    logf("monitor %d: overlay present failed (0x%08lx): render device lost", index, (unsigned long)pr);
+    g_deviceLost = true;
+  }
   processedOnce_ = true;
   if (newFrame) {
     static const double qpcPerMs = [] {

@@ -183,5 +183,9 @@ class Monitor {
   std::chrono::steady_clock::time_point fpsWindow_ = std::chrono::steady_clock::now();
 };
 
-// Set by the overlay window procedure when the display configuration changes.
+// Set by the overlay window procedure when the display configuration changes, and by the capture
+// path when its device or frame hand-over breaks: the main loop rebuilds all monitors.
 extern volatile bool g_displayChanged;
+// Set when the render device is removed/reset (overlay presents fail): the main loop recreates the
+// whole GPU side.
+extern volatile bool g_deviceLost;
