@@ -69,6 +69,11 @@ class Monitor {
 
   void reassertTopmost();
 
+  // Hide the overlay while a fullscreen app (game) owns this monitor: a topmost overlay would sit on
+  // top of it and knock it out of independent flip. Capture keeps running; process() is skipped.
+  void setSuspended(bool s);
+  bool suspended() const { return suspended_; }
+
   // "Start protected": up to 4 desktop-space rects that are dimmed to `gain` (linear) before their
   // content has been captured, e.g. a window that was just shown. gain 1 = inactive.
   void setPreDim(const RECT* rects, const float* gains, int count);
@@ -142,6 +147,7 @@ class Monitor {
   ComPtr<IDXGIKeyedMutex> mainMutex_;
 
   HWND hwnd_ = nullptr;
+  bool suspended_ = false;
   ComPtr<IDXGISwapChain1> swap_;
   ComPtr<ID3D11RenderTargetView> rtv_;
   ComPtr<IDCompositionTarget> target_;

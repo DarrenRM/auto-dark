@@ -7,6 +7,7 @@
     {"id": "protect", "label": "Start protected", "help": "Dim a window the instant it appears, before its first frame can be measured, then hand over to the measured result. Beats the overlay's capture lag for new windows."},
     {"id": "color", "label": "Treated-area color", "help": "Color recipe applied only where the guard is dimming, scaled by how hard it dims and by time of day. Stacks on top of f.lux. Bypass turns it off too."},
     {"id": "schedule", "label": "Sun schedule", "help": "Time-of-day phases used when Treated-area color is set to Sun schedule."},
+    {"id": "fullscreen", "label": "Fullscreen apps", "help": "Step aside for fullscreen games: the overlay on that monitor is hidden while one is in front, so it doesn't dim the game or cost it latency."},
     {"id": "debug", "label": "Debug view", "help": "Visualisations drawn on the real desktop."}
   ],
   "params": [
@@ -96,6 +97,9 @@
       "help": "For sunrise/sunset. Click the value to type." },
     {"id": "longitude", "label": "Longitude", "group": "schedule", "type": "float", "min": -180, "max": 180, "step": 0.01, "default": 0,
       "help": "For sunrise/sunset (west is negative)." },
+
+    {"id": "fullscreenPause", "label": "Pause for", "group": "fullscreen", "type": "enum", "options": ["Never", "Games (not browsers)", "Any fullscreen app"], "default": 1,
+      "help": "Games: any borderless or exclusive fullscreen window except browsers, so fullscreen web video stays guarded. Any: browsers too." },
 
     {"id": "debugView", "label": "View", "group": "debug", "type": "enum", "options": ["Off", "Selection mask", "Gain heatmap", "Split (raw right)"], "default": 0,
       "help": "Overlay visualisation on the real desktop." },

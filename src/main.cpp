@@ -122,6 +122,50 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, L
   g_preDimNew = true;
 }
 
+// ---- Fullscreen apps: a game (or video) covering a whole monitor gets that monitor's overlay hidden.
+// Browsers stay guarded in "games" mode since fullscreen web video is exactly what we protect against.
+bool isBrowserProcess(DWORD pid) {
+  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!h) return false;
+  wchar_t path[MAX_PATH];
+  DWORD n = MAX_PATH;
+  bool ok = QueryFullProcessImageNameW(h, 0, path, &n);
+  CloseHandle(h);
+  if (!ok) return false;
+  const wchar_t* exe = wcsrchr(path, L'\\');
+  exe = exe ? exe + 1 : path;
+  static const wchar_t* kBrowsers[] = {L"chrome.exe", L"msedge.exe", L"firefox.exe", L"brave.exe",
+                                       L"opera.exe",  L"vivaldi.exe", L"arc.exe",    L"librewolf.exe"};
+  for (auto b : kBrowsers)
+    if (!_wcsicmp(exe, b)) return true;
+  return false;
+}
+
+// The desktop rect of the monitor the foreground window fills, or false. mode: 1 = games (non-browser), 2 = any.
+bool fullscreenForeground(int mode, RECT& out) {
+  HWND fg = GetForegroundWindow();
+  if (!fg || mode <= 0 || !IsWindowVisible(fg) || IsIconic(fg)) return false;
+  wchar_t cls[32] = {};
+  GetClassNameW(fg, cls, 32);
+  if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") || !wcscmp(cls, L"Shell_TrayWnd")) return false;
+  // Maximized normal windows also cover the monitor (auto-hide taskbar); fullscreen ones have no caption.
+  if ((GetWindowLongW(fg, GWL_STYLE) & WS_CAPTION) == WS_CAPTION) return false;
+  BOOL cloaked = FALSE;
+  DwmGetWindowAttribute(fg, DWMWA_CLOAKED, &cloaked, sizeof cloaked);
+  if (cloaked) return false;
+  RECT r;
+  if (!GetWindowRect(fg, &r)) return false;
+  MONITORINFO mi{sizeof mi};
+  if (!GetMonitorInfoW(MonitorFromWindow(fg, MONITOR_DEFAULTTONULL), &mi)) return false;
+  const RECT& m = mi.rcMonitor;
+  if (r.left > m.left || r.top > m.top || r.right < m.right || r.bottom < m.bottom) return false;
+  DWORD pid = 0;
+  GetWindowThreadProcessId(fg, &pid);
+  if (pid == GetCurrentProcessId() || (mode == 1 && isBrowserProcess(pid))) return false;
+  out = m;
+  return true;
+}
+
 // Worst-case gain for a rect of area fraction `a` on a monitor, assuming it is entirely white:
 // its own neighbourhood budget, and the whole-screen budget spread over it.
 float preDimGainFor(const ParamStore& p, const std::vector<std::pair<double, double>>& curve, double a) {
@@ -544,7 +588,7 @@ int main() {
 
   using clock = std::chrono::steady_clock;
   auto start = clock::now(), last = start, lastPoll = start, lastStats = start, lastPreview = start,
-       lastTopmost = start, lastHealth = start;
+       lastTopmost = start, lastHealth = start, lastFullscreen = start;
 
   while (!g.quit) {
     // Tray requests for the tuning panel.
@@ -778,6 +822,20 @@ int main() {
           g.previewJpegMon = mon;
           g.previewJpegMode = gotMode;
         }
+      }
+    }
+
+    // Fullscreen app in front (4 Hz): hide that monitor's overlay until it leaves.
+    if (now - lastFullscreen > std::chrono::milliseconds(250)) {
+      lastFullscreen = now;
+      RECT fs{};
+      bool any = fullscreenForeground((int)params.get("fullscreenPause", 1), fs);
+      for (auto& m : monitors) {
+        bool want = any && EqualRect(&fs, &m->desktop);
+        if (want == m->suspended()) continue;
+        m->setSuspended(want);
+        logf("monitor %d: %s (fullscreen app)", m->index, want ? "paused" : "resumed");
+        if (!want) g.resetTemporal = true;  // the state is from before the app; start fresh
       }
     }
 

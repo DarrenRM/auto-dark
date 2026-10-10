@@ -500,7 +500,7 @@ void Monitor::runPipeline(const FrameInputs& in, int kmin, int kmax) {
 }
 
 bool Monitor::process(const FrameInputs& in) {
-  if (!in.shaders || !hasFrame_) return false;
+  if (suspended_ || !in.shaders || !hasFrame_) return false;
   bool newFrame = newFrame_.exchange(false);
   int64_t framePresent = framePresentQpc_, frameAcquire = frameAcquireQpc_;
   if (newFrame) {
@@ -723,6 +723,22 @@ std::vector<Monitor::ProbeSample> Monitor::probeSamples() {
 }
 
 void Monitor::reassertTopmost() {
-  if (hwnd_)
+  if (hwnd_ && !suspended_)
     SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+}
+
+void Monitor::setSuspended(bool s) {
+  if (s == suspended_ || !hwnd_) return;
+  suspended_ = s;
+  if (s) {
+    // Clear first so the stale dimming isn't what reappears for a frame on resume.
+    float clear[4] = {0, 0, 0, 0};
+    ctx_->OMSetRenderTargets(1, rtv_.GetAddressOf(), nullptr);
+    ctx_->ClearRenderTargetView(rtv_.Get(), clear);
+    swap_->Present(0, 0);
+    ShowWindow(hwnd_, SW_HIDE);
+  } else {
+    ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+    reassertTopmost();
+  }
 }

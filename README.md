@@ -75,6 +75,8 @@ Launching it again while it's running opens the tuning panel of the running copy
 ## Current limitations (backend A: overlay)
 
 - The overlay can only darken.
-- Exclusive-fullscreen apps and the secure desktop (UAC, lock screen) aren't covered.
+- Fullscreen games aren't guarded: by default the overlay on that monitor hides while a fullscreen,
+  non-browser window is in front (Fullscreen apps → Pause for). The secure desktop (UAC, lock
+  screen) isn't covered either.
 - Per-pixel settings (`Finest scale` 0, `Selective scale` 0, `Protect darks`) can ghost while
   scrolling, because the overlay lags the content.
