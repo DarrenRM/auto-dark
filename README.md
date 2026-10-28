@@ -1,82 +1,104 @@
 # auto-dark
 
-Always-on "flashbang guard" for Windows. It enforces a brightness budget that depends on the
-size of the bright area: big bright regions get dimmed hard, while small highlights and dark
-content are left alone. You tune it live from a local web panel. See [PLAN.md](PLAN.md) for the design.
+An always-on brightness guard for the Windows desktop: the larger a bright area, the less brightness it is allowed.
 
-## Build
+## What it is
+
+A full-screen white page in a dark room is the "flashbang". auto-dark removes it at the pixel level,
+for every window and app, without knowing anything about them. It gives each bright region a
+brightness budget that shrinks as the region grows: a large white page is dimmed hard, while a small
+highlight or dark content is left alone. It runs as a tray app, and you tune it live from a local
+web panel. The design is in [PLAN.md](PLAN.md).
+
+## What's interesting
+
+- **A rule about area, not about apps.** The budget curve maps the size of a bright region to its
+  maximum mean luminance. Its left end is a highlight ceiling and its right end is the whole-screen
+  budget. A GPU luminance pyramid measures every scale at once, and dimming is applied from coarse
+  to fine, so the fade lands in the dark surroundings instead of inside the bright region.
+- **44 live parameters from one schema file.** `shaders/params.json` defines each parameter's
+  range, group and help text. The engine binds them to the shader constant buffer by name through
+  shader reflection, and the web panel generates its sliders from the same file. Adding a parameter
+  takes one line of JSON and one declaration in HLSL, with no C++ or UI change.
+- **Shaders hot-reload and keep the last good build.** Saving a `.hlsl` file, `common.hlsli` or
+  `params.json` recompiles live. If compilation fails, the previous shaders keep running and the
+  error shows in the panel, so tuning by eye never leaves the screen unguarded.
+- **Latency measured on the real desktop.** Capture runs on its own thread and device and wakes the
+  render loop when Windows presents a frame. A pixel probe (`--probe X Y`) samples one desktop pixel
+  per captured frame with QPC timestamps, which is how latency and flash frames are counted. A
+  "start protected" pre-dim darkens a window the moment it appears, before its first frame.
+- **Built to stay on.** It recovers from GPU device loss and broken capture hand-overs, pauses the
+  overlay on a monitor owned by a fullscreen app, and has a bypass hotkey. The web server binds to
+  127.0.0.1 only, checks Host and Origin headers, and is off until you open the panel.
+
+## How it works
+
+```
+Desktop Duplication (own thread + device, one per monitor)
+        |
+        v
+  luma  ->  gain  ->  temporal  ->  apply            HLSL, Direct3D 11
+  sRGB to   budget    instant      B-spline upsample,
+  linear,   per       attack,      per-pixel response,
+  mip       level,    slow         debug views
+  pyramid   coarse    release
+            to fine
+        |
+        v
+Click-through topmost overlay (DirectComposition), excluded from capture;
+it draws black with alpha = 1 - gain, so the desktop is multiplied by the gain
+
+Web panel (127.0.0.1:7777) <-> HTTP/JSON <-> engine: params, profiles, previews, meters
+```
+
+The overlay can only darken, and it trails the content by a frame or two. `PLAN.md` describes a
+second backend, a hook inside the compositor that would filter frames before they are presented. It
+is not built. Fullscreen games are out of scope, and the secure desktop (UAC, lock screen) is not
+covered.
+
+## Running it locally
+
+Requirements: Windows 10 version 2004 or newer (developed on 22H2), x64, a Direct3D 11 GPU, Visual
+Studio 2022 with the C++ workload and a Windows SDK, and CMake 3.20 or newer. No environment
+variables are needed.
 
 ```bash
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
-```
-
-## Run
-
-```bash
 ./build/Release/auto-dark.exe
 ```
 
-It runs in the background as a **tray app** (no window). The tray icon is amber while guarding and
-grey while bypassed. Right-click it for:
-
-- **Bypass**, **Profile** (switch), **Exit**
-- **Open tuning panel**: starts the web panel at http://127.0.0.1:7777/ and opens it (double-click
-  the icon does the same). **Stop tuning panel** turns the web server off again; it is off by default.
-- **Start with Windows**: adds or removes a per-user startup entry (no admin needed).
-
-Launching it again while it's running opens the tuning panel of the running copy. The log is at
+It starts as a tray app with no window. Right-click the icon for Bypass, Profile, Open tuning
+panel and Start with Windows. The executable reads `shaders/`, `web/` and `profiles/` from the
+source tree, which is what makes hot reload work, so run it from a checkout. The log is
 `logs/auto-dark.log`; `--console` shows it live.
 
 | Flag | Effect |
 |---|---|
-| `--open` | start the tuning panel and open it in your browser |
-| `--panel` | start the tuning panel's web server (without opening a browser) |
+| `--open` / `--panel` | start the tuning panel, with or without opening a browser |
 | `--console` | show a console window with the log |
-| `--bypass` | start with filtering off |
-| `--profile NAME` | start with a given profile |
+| `--bypass` / `--profile NAME` | start with filtering off / with a given profile |
 | `--port N` | panel port (default 7777) |
-| `--no-exclude` | debug: don't hide the overlay from capture (it will feed back into itself) |
-| `--debug-layer` | enable the D3D11 debug layer |
-| `--vblank` | old loop timing (wait for vblank), for latency A/B tests |
-| `--probe X Y` | test: sample one desktop pixel per captured frame, served at `/api/probe` (use with `--no-exclude`) |
+| `--probe X Y` | sample one desktop pixel per captured frame, served at `/api/probe` (use with `--no-exclude`) |
 
-**Hotkeys:** `Ctrl+Alt+F12` bypass · `Ctrl+Alt+F11` next profile · `Ctrl+Alt+F10` cycle debug view.
+Hotkeys: `Ctrl+Alt+F12` bypass, `Ctrl+Alt+F11` next profile, `Ctrl+Alt+F10` cycle debug view.
+Open http://127.0.0.1:7777/test/flash.html for a bright page to tune against.
 
-## Tuning workflow
+## Status
 
-- **Budget curve:** sets the allowed mean brightness for a given bright-area size. The left end
-  works as the highlight ceiling, and the right end is the whole-screen budget.
-- **Debug views:** *Selection* shows what counts as bright. *Gain heatmap* shows where dimming happens
-  and how strong it is. *Split* shows filtered on the left and raw on the right.
-- **Profiles:** save variants (night, day, video...) and switch between them with `Ctrl+Alt+F11`.
-- **Test pages:** http://127.0.0.1:7777/test/flash.html is a bright page to tune against.
+- Always on: it runs as a tray app on the author's desktop and has since October 2026.
+- C++20, Direct3D 11 and HLSL shaders, with a web panel in plain JavaScript.
+- 44 live parameters from `shaders/params.json`; profiles are JSON files in `profiles/`.
+- Shaders hot-reload and keep the last good build.
+- Measured with the pixel probe on a 144 Hz screen: content that changes inside an existing window
+  shows for about 2 frames (about 14 ms) before dimming, and newly shown windows had 0
+  full-brightness frames with "start protected" on.
 
-## Adding a parameter or idea
+## How it was built
 
-1. Add an entry to `shaders/params.json`. A slider appears in the panel.
-2. Declare it in the `Params` cbuffer in `shaders/common.hlsli` (same name).
-3. Use it in any shader. Saving the file recompiles live. If compilation fails, the last good
-   shaders keep running and the error shows in the panel.
+Designed and directed by Darren Mills, built with AI coding agents. The commit history carries the
+agent's `Co-Authored-By` trailers, and `PLAN.md` holds the design and build order the work followed.
 
-## Latency (backend A: overlay)
+## License
 
-- Capture runs on its own thread and device and wakes the render loop the moment Windows presents
-  a new desktop frame; the overlay is presented ~1 ms later (shown as **lag** in the panel meters).
-- Measured on a 144 Hz screen: content that changes inside an existing window still shows for about
-  2 frames (~14 ms) before dimming, because Windows has usually started its next composition by the
-  time it hands us a frame. The old vblank-paced loop showed 2–3 frames.
-- **Start protected** pre-dims a window the instant it is shown or restored, before its first frame:
-  measured 0 full-brightness frames for new windows. Optional triggers for foreground switches and
-  title changes (browser tabs) trade brief dips on dark content for coverage.
-- The remaining in-window lag can only be removed by backend B (DWM), which filters the frame
-  before it is presented.
-
-## Current limitations (backend A: overlay)
-
-- The overlay can only darken.
-- Fullscreen games aren't guarded: by default the overlay on that monitor hides while a fullscreen,
-  non-browser window is in front (Fullscreen apps → Pause for). The secure desktop (UAC, lock
-  screen) isn't covered either.
-- Per-pixel settings (`Finest scale` 0, `Selective scale` 0, `Protect darks`) can ghost while
-  scrolling, because the overlay lags the content.
+No license yet.
