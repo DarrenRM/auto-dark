@@ -1,3 +1,38 @@
+# Build output
 build/
-profiles/.active
+out/
+x64/
+Debug/
+Release/
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.exp
+*.idb
+*.pch
+*.cso
+
+# Visual Studio and CMake caches
+.vs/
+ipch/
+*.sdf
+*.suo
+*.user
+*.VC.db
+*.VC.opendb
+CMakeUserPresets.json
+
+# Local runtime state
 logs/
+*.log
+profiles/.active
+
+# Local secrets and desktop recordings
+.env
+.env.*
+!.env.example
+*.mp4
+*.mkv
