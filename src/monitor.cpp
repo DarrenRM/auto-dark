@@ -90,8 +90,12 @@ bool Monitor::init(IDXGIOutput* output, int idx, bool excludeFromCapture, std::s
   GetMonitorInfoW(od.Monitor, &mi);
   primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
   numLevels = (int)std::floor(std::log2((double)std::max(width, height))) + 1;
-  if (od.Rotation != DXGI_MODE_ROTATION_IDENTITY && od.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED)
-    logf("monitor %s: rotated outputs are not handled yet", name.c_str());
+  if (od.Rotation != DXGI_MODE_ROTATION_IDENTITY && od.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED) {
+    // Desktop Duplication delivers a rotated output's frames unrotated, which the overlay doesn't map
+    // yet, and the size mismatch would rebuild this monitor in a loop. Leave it unguarded instead.
+    err = name + ": rotated outputs are not supported yet; this monitor is skipped";
+    return false;
+  }
 
   if (!createResources(err)) return false;
   if (!createCaptureDevice(err)) return false;

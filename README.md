@@ -53,8 +53,8 @@ Web panel (127.0.0.1:7777) <-> HTTP/JSON <-> engine: params, profiles, previews,
 
 The overlay can only darken, and it trails the content by a frame or two. `PLAN.md` describes a
 second backend, a hook inside the compositor that would filter frames before they are presented. It
-is not built. Fullscreen games are out of scope, and the secure desktop (UAC, lock screen) is not
-covered.
+is not built. Fullscreen games are out of scope, the secure desktop (UAC, lock screen) is not
+covered, and rotated (portrait) monitors are skipped for now.
 
 ## Running it locally
 
