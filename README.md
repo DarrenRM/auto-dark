@@ -101,4 +101,4 @@ agent's `Co-Authored-By` trailers, and `PLAN.md` holds the design and build orde
 
 ## License
 
-No license yet.
+MIT. See [LICENSE](LICENSE).
