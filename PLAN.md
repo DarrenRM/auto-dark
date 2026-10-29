@@ -4,8 +4,8 @@ An always-on **spatial luminance limiter** for the Windows desktop. The rule it 
 "the larger a bright area, the lower its allowed brightness". It works on pixels and regions,
 with no knowledge of windows or apps. Tuning happens live from a local web control panel.
 
-## Machine context
-- Windows 10 22H2 (19045), RTX 3080 Ti, VS 2022 + Windows SDK 26100, CMake, Node 22.
+## Development machine
+- Windows 10 22H2 (19045), RTX 3080 Ti, VS 2022 + Windows SDK 26100, CMake.
 - Monitors: Samsung LS28AG700N 4K @175% (primary, HDR capable but off) + ASUS VG248 1080p 144 Hz.
 - SDR pipeline for now; all shader math is done in linear light so HDR can be added later.
 - Games are out of scope.
@@ -52,8 +52,8 @@ Its left end acts as the highlight ceiling; its right end is the whole-screen bu
 2. [x] HTTP API + web control panel: schema-driven sliders, curve editor, profiles, preview, meters.
 3. [x] Algorithm v1 (above), tuned live from there.
 4. [ ] Backend B (DWM): a hook DLL inside dwm.exe, running the same shader chain before present.
-   The design below follows the research on ledoge/dwm_lut (GPL-3). It assumes a clean-room
-   reimplementation of the technique unless we decide to fork under GPL.
+   The design below follows the research on ledoge/dwm_lut (GPL-3). Backend B would be a clean-room
+   implementation of the technique; no dwm_lut code is used.
    - **Injection:** an admin injector enables SeDebugPrivilege and copies the DLL somewhere the
      `Window Manager\DWM-N` account can read. It then calls
      `CreateRemoteThread(LoadLibrary)` to load it and `CreateRemoteThread(FreeLibrary)` to unload.
