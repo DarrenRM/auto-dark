@@ -92,14 +92,17 @@ void ColorPlan::updateSchedule(const ParamStore& p) {
   double trans = p.get("transitionMin", 60);
   double wake = p.get("wakeTime", 6) * 60, bed = p.get("bedTime", 22) * 60;
   double rise = 6 * 60, set = 18 * 60;
-  bool sun = sunTimes(p.get("latitude", 0), p.get("longitude", 0), rise, set);
+  // Latitude and longitude both 0 means no location is set, so the 06:00-18:00 fallback stays.
+  double lat = p.get("latitude", 0), lon = p.get("longitude", 0);
+  bool located = lat != 0 || lon != 0;
+  bool sun = located && sunTimes(lat, lon, rise, set);
   night_ = inInterval(now, set, std::max(rise, wake), trans);
   late_ = inInterval(now, bed, wake, trans);
   const char* phase = late_ > 0.5 ? "late" : night_ > 0.5 ? "evening" : "day";
   char buf[160];
   snprintf(buf, sizeof buf, "%s %s: %s · sunset %s · bedtime %s · sunrise %s%s", simulated ? "SIMULATED" : "now",
            clock(now).c_str(), phase, clock(set).c_str(), clock(bed).c_str(), clock(rise).c_str(),
-           sun ? "" : " (no sunrise/sunset today)");
+           !located ? " (no location set)" : sun ? "" : " (no sunrise/sunset today)");
   statusSchedule_ = buf;
 }
 
