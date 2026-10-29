@@ -589,6 +589,9 @@ int main() {
   using clock = std::chrono::steady_clock;
   auto start = clock::now(), last = start, lastPoll = start, lastStats = start, lastPreview = start,
        lastTopmost = start, lastHealth = start, lastFullscreen = start;
+  // A monitor's capture reset waits until its capture errors have been quiet this long, and runs at
+  // most once per gap, in case the errors keep coming back.
+  constexpr uint64_t kCaptureQuietMs = 1500, kCaptureResetGapMs = 5000;
 
   while (!g.quit) {
     // Tray requests for the tuning panel.
@@ -625,8 +628,9 @@ int main() {
         g_deviceLost = true;
       }
     }
-    if (g_deviceLost || g.simulateDeviceLoss.exchange(false)) {
-      g_deviceLost = false;
+    bool deviceLost = g_deviceLost.exchange(false);
+    if (g.simulateDeviceLoss.exchange(false)) deviceLost = true;
+    if (deviceLost) {
       logf("gpu: recreating devices, shaders and monitors");
       monitors.clear();
       paramsCB.Reset();
@@ -641,8 +645,25 @@ int main() {
       g_displayChanged = true;  // rebuild monitors on the new device below
     }
 
-    if (g_displayChanged || g.simulateCaptureLoss.exchange(false)) {
-      g_displayChanged = false;
+    // A monitor whose capture errors have gone quiet gets a fresh capture device (see
+    // Monitor::resetCapture). Its overlay stays up throughout, and the other monitors are untouched.
+    for (auto& m : monitors) {
+      uint64_t errorTick = m->captureErrorTick();
+      if (!errorTick) continue;
+      uint64_t tick = GetTickCount64();  // read after errorTick, so it is never older
+      if (tick - errorTick <= kCaptureQuietMs || tick - m->lastCaptureReset <= kCaptureResetGapMs) continue;
+      m->lastCaptureReset = tick;
+      logf("monitor %d: capture errors stopped; resetting its capture device", m->index);
+      std::string err;
+      if (!m->resetCapture(err)) {
+        logf("monitor %d: capture reset failed (%s); rebuilding monitors", m->index, err.c_str());
+        g_displayChanged = true;
+      }
+    }
+
+    bool displayChanged = g_displayChanged.exchange(false);
+    if (g.simulateCaptureLoss.exchange(false)) displayChanged = true;
+    if (displayChanged) {
       logf("display/capture changed; rebuilding monitors");
       monitors.clear();
       Sleep(500);

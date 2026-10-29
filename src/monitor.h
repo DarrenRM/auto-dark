@@ -56,6 +56,15 @@ class Monitor {
   void stopCapture();
   // Duplication currently unavailable (secure desktop, mode change...); the thread keeps retrying.
   bool lost() const { return lost_; }
+  // GetTickCount64() of this monitor's latest capture error, such as lost access during a display-mode
+  // switch (0 = none pending).
+  uint64_t captureErrorTick() const { return captureErrorTick_; }
+  // Reacquiring on the same capture device isn't always enough after such errors: it can keep
+  // delivering frames that all hold one frozen image. This gives the capture side a fresh device and
+  // restarts its thread. The overlay window is untouched and keeps presenting the last dimming until
+  // the first new frame arrives. Call from the render thread.
+  bool resetCapture(std::string& err);
+  uint64_t lastCaptureReset = 0;  // GetTickCount64() of the latest resetCapture(); render thread only
 
   // Runs the pipeline on the newest captured image and presents the overlay. Skips work when idle.
   // Returns true if it presented (so the caller keeps a fast cadence while animating).
@@ -123,12 +132,13 @@ class Monitor {
   ComPtr<ID3D11Texture2D> probeStaging_;
   std::mutex probeMu_;
   std::vector<ProbeSample> probe_;
-  bool reacquire();
+  bool reacquire(HRESULT* result = nullptr);
   bool createCaptureDevice(std::string& err);
 
   ComPtr<IDXGIOutput1> output_;
   ComPtr<IDXGIOutputDuplication> dupl_;  // owned by the capture thread
   std::atomic<bool> lost_{false};
+  std::atomic<uint64_t> captureErrorTick_{0};
   std::atomic<bool> hasFrame_{false};
   std::atomic<bool> newFrame_{false};
   std::atomic<bool> capRun_{false};
@@ -191,7 +201,7 @@ class Monitor {
 
 // Set by the overlay window procedure when the display configuration changes, and by the capture
 // path when its device or frame hand-over breaks: the main loop rebuilds all monitors.
-extern volatile bool g_displayChanged;
+extern std::atomic<bool> g_displayChanged;
 // Set when the render device is removed/reset (overlay presents fail): the main loop recreates the
 // whole GPU side.
-extern volatile bool g_deviceLost;
+extern std::atomic<bool> g_deviceLost;

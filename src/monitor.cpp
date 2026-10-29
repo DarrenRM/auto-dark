@@ -6,8 +6,8 @@
 
 #include "log.h"
 
-volatile bool g_displayChanged = false;
-volatile bool g_deviceLost = false;
+std::atomic<bool> g_displayChanged{false};
+std::atomic<bool> g_deviceLost{false};
 
 namespace {
 
@@ -105,9 +105,10 @@ bool Monitor::init(IDXGIOutput* output, int idx, bool excludeFromCapture, std::s
   return true;
 }
 
-bool Monitor::reacquire() {
+bool Monitor::reacquire(HRESULT* result) {
   dupl_.Reset();
   HRESULT hr = output_->DuplicateOutput(capDev_.Get(), &dupl_);
+  if (result) *result = hr;
   lost_ = FAILED(hr);
   if (!lost_) hasFrame_ = false;
   return !lost_;
@@ -154,14 +155,48 @@ void Monitor::stopCapture() {
   if (capThread_.joinable()) capThread_.join();
 }
 
+bool Monitor::resetCapture(std::string& err) {
+  stopCapture();
+  dupl_.Reset();
+  mainMutex_.Reset();
+  captureTex_.Reset();
+  capMutex_.Reset();
+  capShared_.Reset();
+  probeStaging_.Reset();
+  capCtx_.Reset();
+  capDev_.Reset();
+  captureErrorTick_ = 0;
+  newFrame_ = false;  // the old shared texture is gone
+  if (!createCaptureDevice(err)) return false;
+  if (probeOn_) enableProbe(desktop.left + probeX_, desktop.top + probeY_);  // staging lives on the capture device
+  if (!reacquire()) logf("monitor %d: duplication not available yet", index);
+  startCapture(wake_);
+  return true;
+}
+
 void Monitor::captureLoop() {
   // Capture is the start of the latency chain: run it at high priority.
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+  HRESULT lastFailure = S_OK;  // logged once per change, so a monitor that stays lost shows in the log
   while (capRun_) {
     if (!dupl_) {
-      if (!reacquire()) {
+      HRESULT hr = S_OK;
+      if (!reacquire(&hr)) {
+        if (hr != lastFailure) {
+          logf("monitor %d: duplication unavailable (0x%08lx), retrying", index, (unsigned long)hr);
+          lastFailure = hr;
+        }
+        // The secure desktop (a UAC prompt, the lock screen) refuses duplication until it closes, so a
+        // pending capture reset waits for it. Any other failure may come from the stale device itself,
+        // so the reset goes ahead.
+        if (captureErrorTick_ && (hr == E_ACCESSDENIED || hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE))
+          captureErrorTick_ = GetTickCount64();
         Sleep(250);
         continue;
+      }
+      if (lastFailure != S_OK) {
+        logf("monitor %d: duplication reacquired", index);
+        lastFailure = S_OK;
       }
     }
     DXGI_OUTDUPL_FRAME_INFO fi{};
@@ -182,6 +217,7 @@ void Monitor::captureLoop() {
       logf("monitor %d: capture lost (0x%08lx), reacquiring", index, (unsigned long)hr);
       dupl_.Reset();
       lost_ = true;
+      captureErrorTick_ = GetTickCount64();
       if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
           FAILED(capDev_->GetDeviceRemovedReason())) {
         logf("monitor %d: capture device removed; rebuilding", index);
